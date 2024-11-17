@@ -1,79 +1,143 @@
-# File: tonfx_bot.py
 import requests
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+import firebase_admin
+from firebase_admin import credentials, firestore
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# Replace with your bot token
+# Replace with your details
 BOT_TOKEN = '7554460064:AAEAy6Y2SIrKPry26fVyzm3STcfwLEbsHqc'
-CHANNEL_USERNAME = '@wenefx'  # Replace with your channel username
+CHANNEL_USERNAME = '@wenefx'  # Your Telegram channel
+FAUCETPAY_EMAIL = 'your-faucetpay-email@example.com'  # Your FaucetPay email
+MIN_WITHDRAW = 0.0005  # Minimum withdrawal limit
+MAX_WITHDRAW = 0.001  # Maximum withdrawal limit
+DAILY_BONUS = 0.0000006  # Daily bonus amount
+REFERRAL_BONUS = 0.00005  # Referral bonus
 
-# Function to check if a user is in the channel
+# Firebase setup
+cred = credentials.Certificate("firebase_key.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# Check if a user is in the Telegram channel
 def is_user_in_channel(user_id: int) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember?chat_id={CHANNEL_USERNAME}&user_id={user_id}"
     response = requests.get(url).json()
     status = response.get("result", {}).get("status", "")
     return status in ["member", "administrator", "creator"]
 
+# Initialize or fetch user balance and referral data
+def get_or_create_user(user_id: int) -> dict:
+    user_ref = db.collection("users").document(str(user_id))
+    user = user_ref.get()
+    if not user.exists:
+        user_ref.set({"balance": 0.0, "referrals": 0})
+        return {"balance": 0.0, "referrals": 0}
+    return user.to_dict()
+
+# Update user balance
+def update_user_balance(user_id: int, amount: float) -> float:
+    user_ref = db.collection("users").document(str(user_id))
+    user_data = get_or_create_user(user_id)
+    new_balance = user_data["balance"] + amount
+    user_ref.update({"balance": new_balance})
+    return new_balance
+
 # Start command handler
 def start(update: Update, context: CallbackContext) -> None:
     user_id = update.effective_user.id
+    referrer_id = None
 
     if not is_user_in_channel(user_id):
         update.message.reply_text(
-            f"🚨 You must join our channel {CHANNEL_USERNAME} to use this bot.\n\n"
-            "👉 [Click to Join Channel](https://t.me/wenefx)\n\n"
+            f"🚨 Join our channel {CHANNEL_USERNAME} to use this bot.\n\n"
+            "👉 [Join Channel](https://t.me/wenefx)\n\n"
             "After joining, type /start again.",
             parse_mode="Markdown",
             disable_web_page_preview=True
         )
         return
 
-    # Welcome message and menu
+    # Check for referral
+    if context.args:
+        referrer_id = context.args[0]
+        if referrer_id != str(user_id):  # Prevent self-referrals
+            update_user_balance(int(referrer_id), REFERRAL_BONUS)
+
+    # Initialize user in Firebase
+    get_or_create_user(user_id)
+
     keyboard = [
-        ["💵 Withdraw", "🎁 Daily Bonus"],
-        ["Earn More", "💰 Balance", "🔗 Referral"]
+        ["🎁 Daily Bonus", "💵 Withdraw"],
+        ["💰 Balance", "🔗 Referral Link"]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     update.message.reply_text(
         "🎉 Welcome to TonFX Bot!\n\n"
-        "📌 Use the menu below to navigate.",
+        "Use the menu below to earn and withdraw TON.",
         reply_markup=reply_markup
     )
 
-# Menu handlers
-def withdraw(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("💵 Withdraw: Feature coming soon!")
-
+# Daily bonus handler
 def daily_bonus(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("🎁 Daily Bonus: Claim your bonus here!")
+    user_id = update.effective_user.id
+    new_balance = update_user_balance(user_id, DAILY_BONUS)
+    update.message.reply_text(f"🎁 You received {DAILY_BONUS} TON as your daily bonus!\n💰 New Balance: {new_balance} TON")
 
-def earn_more(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("📈 Earn More: Learn how to earn more with TonFX.")
-
+# Balance handler
 def balance(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("💰 Balance: Check your balance here!")
+    user_id = update.effective_user.id
+    user_data = get_or_create_user(user_id)
+    update.message.reply_text(f"💰 Your current balance is: {user_data['balance']} TON")
 
+# Referral link handler
 def referral(update: Update, context: CallbackContext) -> None:
     user_id = update.effective_user.id
     referral_link = f"https://t.me/{context.bot.username}?start={user_id}"
-    update.message.reply_text(f"🔗 Referral Link: Share this link to earn rewards!\n\n{referral_link}")
+    update.message.reply_text(f"🔗 Your referral link: {referral_link}\nEarn {REFERRAL_BONUS} TON for each referral!")
+
+# Withdraw handler
+def withdraw(update: Update, context: CallbackContext) -> None:
+    user_id = update.effective_user.id
+    user_data = get_or_create_user(user_id)
+    balance = user_data["balance"]
+
+    if balance < MIN_WITHDRAW:
+        update.message.reply_text(
+            f"❌ Your balance is too low to withdraw. Minimum withdrawal is {MIN_WITHDRAW} TON."
+        )
+        return
+
+    if balance > MAX_WITHDRAW:
+        balance = MAX_WITHDRAW  # Limit to maximum withdrawal
+
+    # FaucetPay API withdrawal request
+    response = requests.post(
+        "https://faucetpay.io/api/v1/withdraw",
+        data={
+            "api_key": "your-faucetpay-api-key",
+            "amount": balance,
+            "to": FAUCETPAY_EMAIL,
+            "currency": "TON"
+        }
+    ).json()
+
+    if response.get("status") == "success":
+        db.collection("users").document(str(user_id)).update({"balance": user_data["balance"] - balance})
+        update.message.reply_text(f"✅ Withdrawal of {balance} TON successful!")
+    else:
+        update.message.reply_text(f"❌ Withdrawal failed: {response.get('message', 'Unknown error')}")
 
 # Main function to run the bot
 def main():
     updater = Updater(BOT_TOKEN)
-
-    # Dispatcher to handle commands and messages
     dispatcher = updater.dispatcher
 
-    # Commands
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.regex("💵 Withdraw"), withdraw))
+    dispatcher.add_handler(CommandHandler("start", start, pass_args=True))
     dispatcher.add_handler(MessageHandler(Filters.regex("🎁 Daily Bonus"), daily_bonus))
-    dispatcher.add_handler(MessageHandler(Filters.regex("Earn More"), earn_more))
     dispatcher.add_handler(MessageHandler(Filters.regex("💰 Balance"), balance))
-    dispatcher.add_handler(MessageHandler(Filters.regex("🔗 Referral"), referral))
+    dispatcher.add_handler(MessageHandler(Filters.regex("🔗 Referral Link"), referral))
+    dispatcher.add_handler(MessageHandler(Filters.regex("💵 Withdraw"), withdraw))
 
-    # Start polling for updates
     updater.start_polling()
     updater.idle()
 
